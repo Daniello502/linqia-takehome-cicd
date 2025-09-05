@@ -1,0 +1,122 @@
+name: CI
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+    branches: ["main"]
+
+permissions:
+  contents: read
+  packages: write
+  pull-requests: write
+
+jobs:
+  build-test:
+    name: Lint, Test (Python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.11", "3.12"]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+          cache-dependency-path: requirements-dev.txt
+
+      - name: Install dev dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-dev.txt
+
+      - name: Lint (ruff)
+        run: |
+          ruff --version
+          ruff check . --exit-zero
+
+      - name: Run tests with coverage
+        run: |
+          mkdir -p reports
+          pytest -q --junitxml=reports/junit.xml --cov=sample_app --cov-report=xml:reports/coverage.xml --cov-report=html:reports/htmlcov --cov-fail-under=90
+
+      - name: Upload artifacts (junit, coverage xml, htmlcov)
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: test-artifacts-py${{ matrix.python-version }}
+          path: |
+            reports/junit.xml
+            reports/coverage.xml
+            reports/htmlcov
+          retention-days: 7
+
+  docker:
+    name: Build and Push Docker Image
+    runs-on: ubuntu-latest
+    needs: [build-test]
+    if: ${{ !cancelled() }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata (tags, labels)
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository }}
+          tags: |
+            type=sha,enable=true,prefix=sha-
+            type=ref,event=branch,prefix=branch-
+            type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' }}
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+
+      - name: Comment on PR with results
+        if: ${{ github.event_name == 'pull_request' }}
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const tags = `${{ toJson(steps.meta.outputs.tags) }}`;
+            const body = [
+              `CI passed. Docker image pushed to ghcr.io/${{ github.repository }}`,
+              '',
+              'Tags:',
+              '``' + '`
+' + tags + '
+' + '``' + '`',
+              '',
+              'Artifacts are attached to the workflow run for each Python version.'
+            ].join('\n');
+            github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body
+            });
