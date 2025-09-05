@@ -9,6 +9,7 @@ permissions:
   contents: read
   packages: write
   pull-requests: write
+  security-events: write
 
 env:
   REGISTRY: ghcr.io
@@ -92,13 +93,19 @@ jobs:
       
       - name: Generate image name and tags
         id: image
+        env:
+          BRANCH_REF: ${{ github.head_ref || github.ref_name }}
         run: |
           # Convert to lowercase for GHCR compatibility
           IMAGE_NAME=$(echo "${{ github.repository }}" | tr '[:upper:]' '[:lower:]')
+          # Sanitize branch/ref name: lowercase, replace invalid chars with '-', trim leading/trailing separators
+          RAW_BRANCH="$BRANCH_REF"
+          SANITIZED_BRANCH=$(echo "$RAW_BRANCH" | tr '[:upper:]' '[:lower:]' | sed -E 's#[^a-z0-9._-]+#-#g' | sed -E 's#-+#-#g' | sed -E 's#(^[._-]+|[._-]+$)##g')
+
           TAGS="${{ env.REGISTRY }}/${IMAGE_NAME}:sha-${{ github.sha }}"
-          TAGS="${TAGS},${{ env.REGISTRY }}/${IMAGE_NAME}:branch-${{ github.ref_name }}"
+          TAGS="${TAGS},${{ env.REGISTRY }}/${IMAGE_NAME}:branch-${SANITIZED_BRANCH}"
           
-          if [[ "${{ github.ref_name }}" == "main" ]]; then
+          if [[ "$SANITIZED_BRANCH" == "main" ]]; then
             TAGS="${TAGS},${{ env.REGISTRY }}/${IMAGE_NAME}:latest"
           fi
           
@@ -114,10 +121,54 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
   
+  scan:
+    name: Scan Image (Trivy)
+    runs-on: ubuntu-latest
+    needs: docker
+    continue-on-error: true
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      
+      - name: Compute image ref
+        id: ref
+        run: |
+          IMAGE_NAME=$(echo "${{ github.repository }}" | tr '[:upper:]' '[:lower:]')
+          echo "image=${{ env.REGISTRY }}/${IMAGE_NAME}:sha-${{ github.sha }}" >> $GITHUB_OUTPUT
+      
+      - name: Trivy scan
+        uses: aquasecurity/trivy-action@0.24.0
+        with:
+          image-ref: ${{ steps.ref.outputs.image }}
+          format: 'sarif'
+          output: 'trivy-results.sarif'
+          ignore-unfixed: true
+          vuln-type: 'os,library'
+          severity: 'CRITICAL,HIGH,MEDIUM'
+      
+      - name: Upload Trivy SARIF to code scanning
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: trivy-results.sarif
+      
+      - name: Upload Trivy report artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: trivy-results
+          path: trivy-results.sarif
+          retention-days: 7
+
   comment:
     name: PR Comment
     runs-on: ubuntu-latest
-    needs: [test, docker]
+    needs: [test, docker, scan]
     if: github.event_name == 'pull_request' && !cancelled()
     
     steps:
@@ -127,6 +178,7 @@ jobs:
           script: |
             const testSuccess = '${{ needs.test.result }}' === 'success';
             const dockerSuccess = '${{ needs.docker.result }}' === 'success';
+            const scanSuccess = '${{ needs.scan.result }}' === 'success';
             const coverage = '${{ needs.test.outputs.coverage }}' || 'N/A';
             const imageName = '${{ needs.docker.outputs.image-name }}';
             
@@ -138,6 +190,7 @@ jobs:
               body += `Package Registry: https://github.com/${{ github.repository }}/pkgs/container/${imageName.split('/')[1]}\n`;
             }
             
+            body += `Image Scan: ${scanSuccess ? 'PASSED' : 'FAILED (non-blocking)'}\n`;
             body += `Artifacts: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}`;
             
             await github.rest.issues.createComment({
