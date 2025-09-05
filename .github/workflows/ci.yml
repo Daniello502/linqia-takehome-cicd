@@ -111,9 +111,9 @@ jobs:
             const body = `CI passed. Docker image pushed to ${image}
 
 Tags:
-\`\`\`
+<pre>
 ${tags}
-\`\`\`
+</pre>
 
 Artifacts are attached to the workflow run for each Python version.`;
             github.rest.issues.createComment({
