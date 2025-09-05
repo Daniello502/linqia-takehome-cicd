@@ -93,13 +93,19 @@ jobs:
       
       - name: Generate image name and tags
         id: image
+        env:
+          BRANCH_REF: ${{ github.head_ref || github.ref_name }}
         run: |
           # Convert to lowercase for GHCR compatibility
           IMAGE_NAME=$(echo "${{ github.repository }}" | tr '[:upper:]' '[:lower:]')
+          # Sanitize branch/ref name: lowercase, replace invalid chars with '-', trim leading/trailing separators
+          RAW_BRANCH="$BRANCH_REF"
+          SANITIZED_BRANCH=$(echo "$RAW_BRANCH" | tr '[:upper:]' '[:lower:]' | sed -E 's#[^a-z0-9._-]+#-#g' | sed -E 's#-+#-#g' | sed -E 's#(^[._-]+|[._-]+$)##g')
+
           TAGS="${{ env.REGISTRY }}/${IMAGE_NAME}:sha-${{ github.sha }}"
-          TAGS="${TAGS},${{ env.REGISTRY }}/${IMAGE_NAME}:branch-${{ github.ref_name }}"
+          TAGS="${TAGS},${{ env.REGISTRY }}/${IMAGE_NAME}:branch-${SANITIZED_BRANCH}"
           
-          if [[ "${{ github.ref_name }}" == "main" ]]; then
+          if [[ "$SANITIZED_BRANCH" == "main" ]]; then
             TAGS="${TAGS},${{ env.REGISTRY }}/${IMAGE_NAME}:latest"
           fi
           
